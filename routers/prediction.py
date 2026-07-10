@@ -313,7 +313,7 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
         raise HTTPException(status_code=422, detail="SUBLEDGER CSV must have an 'Order Date' column.")
 
     # ── Parse order_date ──────────────────────────────────────────────────────
-    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df["order_date"] = pd.to_datetime(df["order_date"], dayfirst=True, errors="coerce")
     df = df.dropna(subset=["order_date"])
 
     # Capture the full-CSV last date BEFORE any filters so future generation
@@ -380,6 +380,12 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
         df, ext_msg = merge_ext_factors(df, ext_df)
     else:
         ext_msg = "No external_factors.csv in model_store — model used training medians."
+
+    # ── Apply payload external factor overrides to historical rows ────────────
+    EXT_COLS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
+    payload_overrides = {c: getattr(payload, c) for c in EXT_COLS if getattr(payload, c, None) not in (None, 0)}
+    for col, val in payload_overrides.items():
+        df[col] = val
 
     # ── Predict historical rows ───────────────────────────────────────────────
     hist_input = df.to_dict(orient="records")
@@ -454,7 +460,6 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
             future_months = []
 
         if future_months:
-                # Unique combos of (Region, Geo, Country, Customer, Item_type)
                 COST_COLS = ["Raw_Material", "Direct_Labor", "Freight", "Storage",
                              "Packaging", "Indirect_Labor", "Rent_Utility", "Overhead"]
                 combo_cols = ["Region", "Geo", "Country", "Customer", "Item_type"]
@@ -463,27 +468,38 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
                     if c in df_num.columns:
                         df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
 
-                combos = df[[c for c in combo_cols if c in df.columns]].drop_duplicates()
-
-                # Build ext factor lookup: period → dict of factor values
+                # Build ext factor lookup from file; payload overrides win
                 ext_lookup: dict = {}
                 last_ext_row: dict = {}
                 if ext_df is not None:
                     for _, er in ext_df.sort_values("year_month").iterrows():
                         key = str(er["year_month"])
-                        row_vals = {c: er[c] for c in ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"] if c in er}
+                        row_vals = {c: er[c] for c in EXT_COLS if c in er}
                         ext_lookup[key] = row_vals
-                        last_ext_row = row_vals  # keep last known
+                        last_ext_row = row_vals
+
+                # Option A: per-combo historical month pattern
+                # For each combo, record which calendar months (1-12) had data
+                df_num["_order_month"] = pd.to_datetime(df_num["order_date"], errors="coerce").dt.month
+                combo_month_map: dict = {}
+                for _, row in df_num.iterrows():
+                    key = tuple(str(row.get(c, "")) for c in combo_cols if c in df_num.columns)
+                    combo_month_map.setdefault(key, set()).add(int(row["_order_month"]) if not pd.isna(row["_order_month"]) else 0)
 
                 future_input_rows = []
-                future_meta = []
 
                 for future_date in future_months:
                     period_key = str(pd.Period(future_date, "M"))
-                    ext_vals = ext_lookup.get(period_key, last_ext_row)
+                    # Base ext vals from file, then apply payload overrides
+                    base_ext = dict(ext_lookup.get(period_key, last_ext_row))
+                    base_ext.update(payload_overrides)
 
-                    for _, combo in combos.iterrows():
-                        # Median cost features for this combo from historical data
+                    for _, combo in df_num[[c for c in combo_cols if c in df_num.columns]].drop_duplicates().iterrows():
+                        combo_key = tuple(str(combo.get(c, "")) for c in combo_cols if c in df_num.columns)
+                        # Only generate a row if this combo historically had data in this calendar month
+                        if future_date.month not in combo_month_map.get(combo_key, set()):
+                            continue
+
                         mask = pd.Series([True] * len(df_num))
                         for c in combo_cols:
                             if c in df_num.columns and c in combo.index:
@@ -504,10 +520,9 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
                             "Item_type": combo.get("Item_type", ""),
                             "Customer": combo.get("Customer", ""),
                             **cost_features,
-                            **ext_vals,
+                            **base_ext,
                         }
                         future_input_rows.append(future_row)
-                        future_meta.append(combo.to_dict())
 
                 if future_input_rows:
                     try:

@@ -722,7 +722,7 @@ def full_dataset_heatmap(
         # Rename Order Date to order_date for merge helper
         date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
         if date_col:
-            df["order_date"] = pd.to_datetime(df[date_col], errors="coerce")
+            df["order_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
             df["year_month"] = df["order_date"].dt.to_period("M")
             ext_df2 = ext_df.copy()
             merged = df.merge(ext_df2, on="year_month", how="left")
@@ -869,7 +869,7 @@ def external_vs_sl_heatmap(
 
     date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
     if ext_df is not None and date_col:
-        df["_order_date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["_order_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
         df["year_month"] = df["_order_date"].dt.to_period("M")
         merged = df.merge(ext_df, on="year_month", how="left")
         merged.drop(columns=["year_month", "_order_date"], inplace=True, errors="ignore")
