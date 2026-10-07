@@ -40,6 +40,7 @@ from auth import get_current_user
 from config import settings
 from db.main_session import get_main_db
 from db.models import FileUpload, IngestionBatch
+from ml.dates import parse_dates
 from ml.ext_factors import EXT_FACTOR_COLS, EXT_FACTORS_FILENAME, load_ext_factors
 from ml.heatmap import (
     EXTERNAL_FACTORS,
@@ -722,7 +723,7 @@ def full_dataset_heatmap(
         # Rename Order Date to order_date for merge helper
         date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
         if date_col:
-            df["order_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+            df["order_date"] = parse_dates(df[date_col])
             df["year_month"] = df["order_date"].dt.to_period("M")
             ext_df2 = ext_df.copy()
             merged = df.merge(ext_df2, on="year_month", how="left")
@@ -869,7 +870,7 @@ def external_vs_sl_heatmap(
 
     date_col = next((c for c in df.columns if c.lower() in ("order date", "order_date")), None)
     if ext_df is not None and date_col:
-        df["_order_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        df["_order_date"] = parse_dates(df[date_col])
         df["year_month"] = df["_order_date"].dt.to_period("M")
         merged = df.merge(ext_df, on="year_month", how="left")
         merged.drop(columns=["year_month", "_order_date"], inplace=True, errors="ignore")
@@ -1158,7 +1159,7 @@ def ext_11x6_append(
     date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
     ext_cols_merged: List[str] = []
     if date_col and ext_df is not None:
-        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df["year_month"] = parse_dates(sl_df[date_col]).dt.to_period("M")
         ext_df["year_month"] = ext_df["date"].dt.to_period("M")
         sl_df = sl_df.merge(ext_df.drop(columns=["date"]), on="year_month", how="left")
         sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
@@ -1216,7 +1217,7 @@ def ext_11x6_replace_latest(
     date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
     ext_cols_merged: List[str] = []
     if date_col and ext_df is not None:
-        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df["year_month"] = parse_dates(sl_df[date_col]).dt.to_period("M")
         sl_df = sl_df.merge(ext_df, on="year_month", how="left")
         sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
         ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
@@ -1269,7 +1270,7 @@ def full_17x17_append(
     date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
     ext_cols_merged: List[str] = []
     if date_col and ext_df is not None:
-        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df["year_month"] = parse_dates(sl_df[date_col]).dt.to_period("M")
         sl_df = sl_df.merge(ext_df, on="year_month", how="left")
         sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
         ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]
@@ -1327,7 +1328,7 @@ def full_17x17_replace_latest(
     date_col = next((c for c in sl_df.columns if c.lower() in ("order date", "order_date")), None)
     ext_cols_merged: List[str] = []
     if date_col and ext_df is not None:
-        sl_df["year_month"] = pd.to_datetime(sl_df[date_col], errors="coerce").dt.to_period("M")
+        sl_df["year_month"] = parse_dates(sl_df[date_col]).dt.to_period("M")
         sl_df = sl_df.merge(ext_df, on="year_month", how="left")
         sl_df.drop(columns=["year_month"], inplace=True, errors="ignore")
         ext_cols_merged = [c for c in EXT_FACTOR_COLS if c in sl_df.columns]

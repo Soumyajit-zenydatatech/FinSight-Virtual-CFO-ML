@@ -18,4 +18,5 @@ scikit-learn>=1.4.0
 pandas>=2.0.0
 numpy>=1.26.0
 joblib>=1.3.0
+statsmodels>=0.14.0            # ext-factor time-series forecasting (Holt-Winters / SARIMA)
 requests>=2.31.0               # download remote SL files

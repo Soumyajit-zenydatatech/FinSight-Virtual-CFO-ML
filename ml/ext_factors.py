@@ -11,6 +11,8 @@ CSV expected columns: Order Date, CCI, CPI, Oil, GDP, Unemployment, ROI
 import os
 import pandas as pd
 
+from ml.dates import parse_dates
+
 EXT_FACTOR_COLS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
 EXT_FACTORS_FILENAME = "external_factors.csv"
 
@@ -38,7 +40,7 @@ def load_ext_factors(model_store_dir: str) -> pd.DataFrame | None:
         return None
 
     # Parse to year-month period
-    df["year_month"] = pd.to_datetime(df[date_col], errors="coerce").dt.to_period("M")
+    df["year_month"] = parse_dates(df[date_col]).dt.to_period("M")
 
     # Keep only factor columns + year_month
     keep = ["year_month"] + [c for c in EXT_FACTOR_COLS if c in df.columns]
@@ -64,9 +66,7 @@ def merge_ext_factors(sl_df: pd.DataFrame, ext_df: pd.DataFrame) -> tuple[pd.Dat
     merged DataFrame, info message string
     """
     sl_df = sl_df.copy()
-    sl_df["year_month"] = pd.to_datetime(
-        sl_df["order_date"], errors="coerce"
-    ).dt.to_period("M")
+    sl_df["year_month"] = parse_dates(sl_df["order_date"]).dt.to_period("M")
 
     merged = sl_df.merge(ext_df, on="year_month", how="left")
     merged.drop(columns=["year_month"], inplace=True)

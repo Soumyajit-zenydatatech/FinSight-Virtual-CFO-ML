@@ -330,3 +330,7 @@ class BatchPredictResponseEnhanced(BaseModel):
     predictions: List[BatchPredictRowEnhanced]
     summary: BatchPredictSummaryEnhanced
     external_factors_info: Optional[str] = None
+    # One entry per future month: the CCI/CPI/Oil/GDP/Unemployment/ROI values that were
+    # actually fed to the revenue model, where they came from ("file" | "forecast" | "none"),
+    # and, for forecasted months, an 80% interval per factor (<factor>_low / <factor>_high).
+    external_factors_forecast: List[Dict[str, Any]] = Field(default_factory=list)

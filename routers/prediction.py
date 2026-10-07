@@ -22,7 +22,9 @@ from config import settings
 from db.main_session import get_main_db
 from db.models import FileUpload, IngestionBatch, TrainedModel
 from db.session import get_db
+from ml.dates import parse_dates
 from ml.ext_factors import load_ext_factors, merge_ext_factors
+from ml.ext_forecaster import get_ext_forecaster
 from ml.predictor import predict
 from schemas import (
     BatchPredictRequest,
@@ -313,7 +315,7 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
         raise HTTPException(status_code=422, detail="SUBLEDGER CSV must have an 'Order Date' column.")
 
     # ── Parse order_date ──────────────────────────────────────────────────────
-    df["order_date"] = pd.to_datetime(df["order_date"], dayfirst=True, errors="coerce")
+    df["order_date"] = parse_dates(df["order_date"])
     df = df.dropna(subset=["order_date"])
 
     # Capture the full-CSV last date BEFORE any filters so future generation
@@ -337,6 +339,9 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
     if df.empty:
         raise HTTPException(status_code=404, detail="No rows found after applying filters.")
 
+    # Keep full filtered df (before date range) for combo/frequency detection
+    df_full_for_combos = df.copy()
+
     # ── Date range filter (only when show_all is False) ───────────────────────
     if not show_all:
         if prediction_start:
@@ -351,8 +356,7 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
                 df = df[df["order_date"] <= df_to_dt]
             except ValueError:
                 raise HTTPException(status_code=422, detail="prediction_end must be YYYY-MM-DD.")
-        if df.empty:
-            raise HTTPException(status_code=404, detail="No rows found in the given date range.")
+        # If date range yields no historical rows it's okay — future rows may still be generated
 
     # ── prediction_end also drives future generation if beyond full CSV range ──
     if prediction_end:
@@ -378,23 +382,24 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
     ext_df = load_ext_factors(settings.MODEL_STORE_DIR)
     if ext_df is not None:
         df, ext_msg = merge_ext_factors(df, ext_df)
+        ext_msg += " Future months beyond ext factor range use linear trend projection."
     else:
         ext_msg = "No external_factors.csv in model_store — model used training medians."
 
-    # ── Apply payload external factor overrides to historical rows ────────────
+    # ── Payload ext factors used for future rows only (historical keeps real values) ──
     EXT_COLS = ["CCI", "CPI", "Oil", "GDP", "Unemployment", "ROI"]
     payload_overrides = {c: getattr(payload, c) for c in EXT_COLS if getattr(payload, c, None) not in (None, 0)}
-    for col, val in payload_overrides.items():
-        df[col] = val
 
-    # ── Predict historical rows ───────────────────────────────────────────────
-    hist_input = df.to_dict(orient="records")
-    try:
-        hist_results = predict(tm.model_file_path, hist_input)
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="Model .pkl file not found on disk.")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {exc}")
+    # ── Predict historical rows (skip if date range yields no historical rows) ──
+    hist_input = df.to_dict(orient="records") if not df.empty else []
+    hist_results = []
+    if hist_input:
+        try:
+            hist_results = predict(tm.model_file_path, hist_input)
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="Model .pkl file not found on disk.")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Prediction error: {exc}")
 
     # ── Build historical prediction rows ──────────────────────────────────────
     predictions: list[BatchPredictRowEnhanced] = []
@@ -441,6 +446,7 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
 
     # ── Generate future rows if prediction_end is beyond last CSV date ─────────
     future_count = 0
+    ext_forecast_out: list = []   # macro path assumed per future month (for the response)
     if pred_end_dt:
         last_csv_date = full_csv_last_date
 
@@ -463,36 +469,89 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
                 COST_COLS = ["Raw_Material", "Direct_Labor", "Freight", "Storage",
                              "Packaging", "Indirect_Labor", "Rent_Utility", "Overhead"]
                 combo_cols = ["Region", "Geo", "Country", "Customer", "Item_type"]
-                df_num = df.copy()
+                # Use full filtered df (ignoring date range) for combos/frequency/cost medians
+                df_num = df_full_for_combos.copy()
                 for c in COST_COLS:
                     if c in df_num.columns:
                         df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
 
-                # Build ext factor lookup from file; payload overrides win
+                # Real ext factor values by month (from file); payload overrides win
                 ext_lookup: dict = {}
-                last_ext_row: dict = {}
                 if ext_df is not None:
                     for _, er in ext_df.sort_values("year_month").iterrows():
-                        key = str(er["year_month"])
-                        row_vals = {c: er[c] for c in EXT_COLS if c in er}
-                        ext_lookup[key] = row_vals
-                        last_ext_row = row_vals
+                        ext_lookup[str(er["year_month"])] = {c: er[c] for c in EXT_COLS if c in er}
 
-                # Option A: per-combo historical month pattern
-                # For each combo, record which calendar months (1-12) had data
-                df_num["_order_month"] = pd.to_datetime(df_num["order_date"], errors="coerce").dt.month
-                combo_month_map: dict = {}
+                # ── Stage 1: forecast ext factors for months not in the file ──────
+                # Fits one time-series model per factor on the file's history
+                # (cached by file mtime) and predicts each requested future month.
+                future_periods = [pd.Period(d, "M") for d in future_months]
+                missing_periods = [p for p in future_periods if str(p) not in ext_lookup]
+                ext_forecast_lookup: dict = {}
+                if missing_periods and ext_df is not None:
+                    forecaster = get_ext_forecaster(settings.MODEL_STORE_DIR)
+                    if forecaster is not None:
+                        fc_df = forecaster.predict(missing_periods)
+                        for _, fr in fc_df.iterrows():
+                            ext_forecast_lookup[str(fr["year_month"])] = fr.to_dict()
+                        ext_msg = ext_msg.replace(
+                            "use linear trend projection.",
+                            f"forecast with {forecaster.describe()}.",
+                        )
+
+                # Per-combo: record which calendar months had data + avg order count per month
+                _od = parse_dates(df_num["order_date"])
+                df_num["_order_month"] = _od.dt.month
+                df_num["_order_year"]  = _od.dt.year
+                combo_month_map: dict = {}   # combo_key → set of calendar months
+                combo_freq_map:  dict = {}   # (combo_key, month) → avg rows per year-month
                 for _, row in df_num.iterrows():
                     key = tuple(str(row.get(c, "")) for c in combo_cols if c in df_num.columns)
-                    combo_month_map.setdefault(key, set()).add(int(row["_order_month"]) if not pd.isna(row["_order_month"]) else 0)
+                    m = int(row["_order_month"]) if not pd.isna(row["_order_month"]) else 0
+                    combo_month_map.setdefault(key, set()).add(m)
+                # Compute average order count per (combo, calendar-month) across years
+                for combo_key in combo_month_map:
+                    mask0 = pd.Series([True] * len(df_num))
+                    for ci, c in enumerate(combo_cols):
+                        if c in df_num.columns:
+                            mask0 = mask0 & (df_num[c].astype(str) == combo_key[ci])
+                    combo_rows = df_num[mask0]
+                    for m in combo_month_map[combo_key]:
+                        month_rows = combo_rows[combo_rows["_order_month"] == m]
+                        # Group by year to get count per year-month occurrence, then average
+                        counts_per_ym = month_rows.groupby("_order_year").size()
+                        avg_count = round(counts_per_ym.mean()) if len(counts_per_ym) > 0 else 1
+                        combo_freq_map[(combo_key, m)] = max(1, int(avg_count))
 
                 future_input_rows = []
+                _ext_used_by_month: dict = {}   # month → macro values actually fed to the model
 
                 for future_date in future_months:
                     period_key = str(pd.Period(future_date, "M"))
-                    # Base ext vals from file, then apply payload overrides
-                    base_ext = dict(ext_lookup.get(period_key, last_ext_row))
+                    if period_key in ext_lookup:
+                        # Real data exists for this month
+                        base_ext = dict(ext_lookup[period_key])
+                        ext_source = "file"
+                    elif period_key in ext_forecast_lookup:
+                        # Stage 1 output: forecasted macro values for this month
+                        fr = ext_forecast_lookup[period_key]
+                        base_ext = {c: fr[c] for c in EXT_COLS if c in fr}
+                        ext_source = "forecast"
+                    else:
+                        base_ext = {}
+                        ext_source = "none"
+                    # Payload overrides always win (user-supplied values take priority)
                     base_ext.update(payload_overrides)
+
+                    # Record the macro path assumed for this month (once per month)
+                    if period_key not in _ext_used_by_month:
+                        entry = {"month": period_key, "source": ext_source}
+                        for c in EXT_COLS:
+                            entry[c] = float(base_ext[c]) if c in base_ext and pd.notna(base_ext[c]) else None
+                            if ext_source == "forecast":
+                                fr = ext_forecast_lookup[period_key]
+                                entry[f"{c}_low"]  = float(fr[f"{c}_low"])  if f"{c}_low"  in fr and pd.notna(fr[f"{c}_low"])  else None
+                                entry[f"{c}_high"] = float(fr[f"{c}_high"]) if f"{c}_high" in fr and pd.notna(fr[f"{c}_high"]) else None
+                        _ext_used_by_month[period_key] = entry
 
                     for _, combo in df_num[[c for c in combo_cols if c in df_num.columns]].drop_duplicates().iterrows():
                         combo_key = tuple(str(combo.get(c, "")) for c in combo_cols if c in df_num.columns)
@@ -500,29 +559,37 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
                         if future_date.month not in combo_month_map.get(combo_key, set()):
                             continue
 
+                        # How many orders did this combo typically place in this calendar month?
+                        repeat = combo_freq_map.get((combo_key, future_date.month), 1)
+
                         mask = pd.Series([True] * len(df_num))
                         for c in combo_cols:
                             if c in df_num.columns and c in combo.index:
                                 mask = mask & (df_num[c].astype(str) == str(combo[c]))
 
-                        combo_df = df_num[mask]
+                        combo_df = df_num[mask].copy()
+                        combo_df["_order_date_dt"] = parse_dates(combo_df["order_date"])
+                        combo_df_sorted = combo_df.sort_values("_order_date_dt")
                         cost_features = {}
                         for c in COST_COLS:
-                            if c in combo_df.columns:
-                                val = combo_df[c].median()
-                                cost_features[c] = float(val) if not pd.isna(val) else None
+                            if c in combo_df_sorted.columns:
+                                last_val = combo_df_sorted[c].dropna().iloc[-1] if combo_df_sorted[c].dropna().shape[0] > 0 else None
+                                cost_features[c] = float(last_val) if last_val is not None else None
 
-                        future_row = {
-                            "order_date": future_date.isoformat(),
-                            "Region": combo.get("Region", ""),
-                            "Geo": combo.get("Geo", ""),
-                            "Country": combo.get("Country", ""),
-                            "Item_type": combo.get("Item_type", ""),
-                            "Customer": combo.get("Customer", ""),
-                            **cost_features,
-                            **base_ext,
-                        }
-                        future_input_rows.append(future_row)
+                        for _ in range(repeat):
+                         future_row = {
+                             "order_date": future_date.isoformat(),
+                             "Region": combo.get("Region", ""),
+                             "Geo": combo.get("Geo", ""),
+                             "Country": combo.get("Country", ""),
+                             "Item_type": combo.get("Item_type", ""),
+                             "Customer": combo.get("Customer", ""),
+                             **cost_features,
+                             **base_ext,
+                         }
+                         future_input_rows.append(future_row)
+
+                ext_forecast_out = list(_ext_used_by_month.values())
 
                 if future_input_rows:
                     try:
@@ -584,4 +651,5 @@ def _predict_from_batch_inner(model_id, payload, prediction_start, prediction_en
             total_predicted_gross_profit=round(total_pred_gp, 4),
         ),
         external_factors_info=ext_msg,
+        external_factors_forecast=ext_forecast_out,
     )

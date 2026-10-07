@@ -27,6 +27,19 @@ from routers import datasets, models_router, prediction, training
 async def lifespan(app: FastAPI):
     """Create DB tables on startup (safe to call on every start — idempotent)."""
     create_tables()
+
+    # Warm the external-factor forecaster cache in the background so the first
+    # /predict/from-batch call with future months does not pay the fit cost.
+    import threading
+
+    def _warm():
+        try:
+            from ml.ext_forecaster import get_ext_forecaster
+            get_ext_forecaster(settings.MODEL_STORE_DIR)
+        except Exception as exc:  # never block startup on this
+            print(f"[startup] ext forecaster warm-up skipped: {exc}")
+
+    threading.Thread(target=_warm, name="ext-forecaster-warmup", daemon=True).start()
     yield
 
 
